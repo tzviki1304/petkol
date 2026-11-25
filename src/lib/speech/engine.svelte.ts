@@ -18,29 +18,31 @@ export interface ModelDef {
   files: { path: string; urls: string[]; bytes?: number }[]
 }
 
-// Android runs the model natively (ONNX Runtime, several threads) where the fp32 encoder is the fastest.
-// The browser build uses the smaller fp16 encoder through WASM.
-const OZEN_ENCODER: 'fp16' | 'fp32' = isNative ? 'fp32' : 'fp16'
+// On Android the model is the "light" int8 build (80 MB instead of 243 MB, same transcripts in our tests,
+// faster): made with onnxruntime quantize_dynamic and hosted in this repo's models-v1 release.
+// The browser build uses the official fp16 encoder from Hugging Face through WASM.
+const OZEN_ENCODER: 'fp16' | 'fp32' | 'int8' = isNative ? 'int8' : 'fp16'
 const HF_OZEN = 'https://huggingface.co/itayinbar/Ozen-v1/resolve/main/'
-const ozenFiles = [
-  'config.json',
-  'generation_config.json',
-  'preprocessor_config.json',
-  'tokenizer.json',
-  'tokenizer_config.json',
-  OZEN_ENCODER === 'fp16' ? 'onnx/encoder_model_fp16.onnx' : 'onnx/encoder_model.onnx',
-  'onnx/decoder_model_merged.onnx',
-]
+const OZEN_JSON = ['config.json', 'generation_config.json', 'preprocessor_config.json', 'tokenizer.json', 'tokenizer_config.json']
+const OZEN_INT8 = ['onnx/encoder_model_int8.onnx', 'onnx/decoder_model_merged_int8.onnx']
+const OZEN_FP32 = ['onnx/encoder_model.onnx', 'onnx/decoder_model_merged.onnx']
+const ozenFile = (f: string) => ({
+  path: `ozen-v1/${f}`,
+  urls: f.includes('_int8') ? [MIRROR + 'ozen-v1__' + f.replace('/', '__')] : [HF_OZEN + f, MIRROR + 'ozen-v1__' + f.replace('/', '__')],
+})
+const ozenFiles = isNative ? [...OZEN_JSON, ...OZEN_INT8] : [...OZEN_JSON, 'onnx/encoder_model_fp16.onnx', 'onnx/decoder_model_merged.onnx']
+const VARIANT_KEY = 'petkol.ozenVariant'
+const LOWMEM_KEY = 'petkol.autoLowMem'
 
 export const MODELS: ModelDef[] = [
   {
     id: 'ozen',
     name: 'אוזן: מודל רגיל',
     short: 'רגיל',
-    description: 'מהיר וקל, מתאים לכל מכשיר. עברית בלבד, דיוק טוב מאוד לדיבור רגיל.',
-    sizeMB: isNative ? 245 : 165,
+    description: 'מהיר וקל, מתאים לכל מכשיר, גם עם 2GB זיכרון. עברית בלבד, דיוק טוב מאוד לדיבור רגיל.',
+    sizeMB: isNative ? 82 : 165,
     minRamMB: 1500,
-    files: ozenFiles.map((f) => ({ path: `ozen-v1/${f}`, urls: [HF_OZEN + f, MIRROR + 'ozen-v1__' + f.replace('/', '__')] })),
+    files: ozenFiles.map(ozenFile),
   },
   {
     id: 'ivrit',
@@ -66,6 +68,13 @@ class SpeechEngine {
   /** Set when the fast native engine crashed the app; we then use the slower, safe engine. */
   nativeBroken = $state(false)
   notice = $state('')
+  /** The old heavy model (243 MB) is installed; the light one is recommended. */
+  upgradeAvailable = $state(false)
+  /** Turned on automatically after the system closed the app for lack of memory. */
+  autoLowMem = $state(false)
+  lastExit = $state<{ reason: string; description?: string; timestamp?: number } | null>(null)
+  availMB = $state(0)
+  modelFiles = $state('')
 
   private worker: Worker | null = null
   private workerReady: Promise<void> | null = null
@@ -81,23 +90,104 @@ class SpeechEngine {
     if (!isNative) this.status.ozen = 'downloaded' // the browser build streams it from Hugging Face and caches it
     if (isNative) {
       try {
-        this.ramMB = (await Native.deviceInfo()).totalRamMB
+        const info = await Native.deviceInfo()
+        this.ramMB = info.totalRamMB
+        this.availMB = info.availRamMB
+      } catch {}
+      if (this.status.ozen !== 'missing' && localStorage.getItem(VARIANT_KEY) !== 'int8') this.upgradeAvailable = true
+      this.autoLowMem = localStorage.getItem(LOWMEM_KEY) === '1'
+      // Why did the app close last time? (Android 11+ keeps the reason.)
+      let exit: { reason: string; description?: string; timestamp?: number; isNew?: boolean } | null = null
+      try {
+        exit = await Native.lastExit()
+        if (exit?.isNew) {
+          this.lastExit = exit
+          // the speech process (":asr") was closed for memory while the app stayed alive: keep it lighter from now on
+          const p = (exit as { processName?: string }).processName ?? ''
+          if (p.endsWith(':asr') && ['low_memory', 'signaled', 'excessive_resource_usage'].includes(exit.reason)) {
+            localStorage.setItem(LOWMEM_KEY, '1')
+          }
+        }
       } catch {}
       // A crash inside native code kills the whole app, so we leave a marker before each native call.
-      // If the marker survived, the previous run died there: switch to the safe engine.
+      // If the marker survived, the previous run died there.
       if (localStorage.getItem(TRY_KEY)) {
         localStorage.removeItem(TRY_KEY)
-        localStorage.setItem(BROKEN_KEY, '1')
-        this.notice = 'המנוע המהיר נכשל במכשיר הזה, ולכן עברנו למנוע הבטוח. הוא איטי יותר, אבל יציב.'
+        const memory = !exit || !exit.isNew || ['low_memory', 'signaled', 'excessive_resource_usage', 'freezer', 'unknown', 'other'].includes(exit.reason)
+        if (memory) {
+          // Killed for memory: the fast engine is fine, it just needs to take less room.
+          localStorage.setItem(LOWMEM_KEY, '1')
+          this.autoLowMem = true
+          this.notice = 'בפעם הקודמת המכשיר סגר את פתקול כי נגמר הזיכרון. הפעלנו "חיסכון בזיכרון": התמלול יהיה קצת איטי יותר, אבל יציב.'
+        } else {
+          localStorage.setItem(BROKEN_KEY, '1')
+          this.notice = 'המנוע המהיר נכשל במכשיר הזה, ולכן עברנו למנוע הבטוח. הוא איטי יותר, אבל יציב.'
+        }
       }
       this.nativeBroken = localStorage.getItem(BROKEN_KEY) === '1'
+      if (this.upgradeAvailable && !this.notice && this.ramMB && this.ramMB <= 3200) {
+        this.notice = 'יש גרסה קלה ומהירה יותר של מודל הדיבור (80MB). מומלץ להוריד אותה בהגדרות ← הכתבה.'
+      }
     }
+  }
+
+  /** Low-memory mode: one model part in memory at a time, fewer threads, shorter recording pieces. */
+  lowMem(): boolean {
+    if (settings.lowMem === 'on') return true
+    if (settings.lowMem === 'off') return false
+    return this.autoLowMem || (!!this.ramMB && this.ramMB <= 3200)
+  }
+
+  /** Recording piece length for long recordings. */
+  chunkSec(): number {
+    if (settings.chunkSec > 0) return settings.chunkSec
+    return this.lowMem() ? 15 : 28
+  }
+
+  /** Downloads the light model over an old heavy one, then deletes the heavy files. */
+  async upgradeOzen() {
+    if (!isNative) return
+    this.status.ozen = 'downloading'
+    this.progress.ozen = 0
+    this.error = ''
+    if (this.ozenNative) {
+      await Native.ozenUnload().catch(() => {})
+      this.ozenNative = false
+    }
+    this.disposeWorker()
+    try {
+      await this.fetchFiles('ozen', [...OZEN_JSON, ...OZEN_INT8].map(ozenFile), 82)
+      for (const f of OZEN_FP32) await Filesystem.deleteFile({ path: `models/ozen-v1/${f}`, directory: Directory.Data }).catch(() => {})
+      localStorage.setItem(VARIANT_KEY, 'int8')
+      this.upgradeAvailable = false
+      this.status.ozen = 'downloaded'
+    } catch (e) {
+      this.status.ozen = 'downloaded' // the old model still works
+      this.error = 'ההורדה נכשלה. בדקו חיבור לאינטרנט ונסו שוב.'
+    }
+  }
+
+  /** Text for "מידע לתמיכה" in settings. */
+  async diagnostics(): Promise<string> {
+    const lines = [`פתקול ${__APP_VERSION__}`]
+    if (isNative) {
+      try {
+        const d = await Native.deviceInfo()
+        lines.push(`מכשיר: ${d.manufacturer} ${d.model}, Android SDK ${d.sdk}, ${d.cores} ליבות`)
+        lines.push(`זיכרון: ${d.totalRamMB}MB, פנוי עכשיו ${d.availRamMB}MB`)
+      } catch {}
+    }
+    lines.push(`מודל: ${settings.engine === 'ivrit' ? 'מדויק' : 'רגיל'} (${localStorage.getItem(VARIANT_KEY) === 'int8' ? 'קל' : isNative ? 'כבד' : 'דפדפן'})${this.modelFiles ? ' · ' + this.modelFiles : ''}`)
+    lines.push(`מנוע: ${this.useNativeOzen() ? 'מהיר' : 'בטוח'}${this.nativeBroken ? ' (המהיר סומן כתקול)' : ''}`)
+    lines.push(`חיסכון בזיכרון: ${this.lowMem() ? 'פועל' : 'כבוי'}${this.autoLowMem ? ' (הופעל אוטומטית)' : ''}, ${this.threads()} מעבדים, קטעים של ${this.chunkSec()} שניות`)
+    if (this.lastExit) lines.push(`סגירה אחרונה: ${this.lastExit.reason}${this.lastExit.description ? ' · ' + this.lastExit.description : ''}`)
+    return lines.join('\n')
   }
 
   /** Threads for the model: fewer on small devices so the CPU and memory are not overwhelmed. */
   threads(): number {
     const cores = navigator.hardwareConcurrency || 4
-    if (settings.calm || (this.ramMB && this.ramMB <= 2600)) return Math.min(2, cores)
+    if (settings.calm || this.lowMem()) return Math.min(2, cores)
     return Math.min(4, cores)
   }
 
@@ -144,44 +234,52 @@ class SpeechEngine {
     this.status[id] = 'downloading'
     this.progress[id] = 0
     this.error = ''
-    this.cancelDownload = false
-    const total = m.sizeMB * 1024 * 1024
-    let doneBytes = 0
     try {
-      for (const f of m.files) {
-        const dir = `models/${f.path.split('/').slice(0, -1).join('/')}`
-        await Filesystem.mkdir({ path: dir, directory: Directory.Data, recursive: true }).catch(() => {})
-        let ok = false
-        let lastErr: unknown = null
-        for (const url of f.urls) {
-          if (this.cancelDownload) throw new Error('בוטל')
-          const handle = await Filesystem.addListener('progress', (p) => {
-            if (p.url !== url) return
-            this.progress[id] = Math.min(0.999, (doneBytes + p.bytes) / total)
-          })
-          try {
-            await Filesystem.downloadFile({ url, path: `models/${f.path}`, directory: Directory.Data, recursive: true, progress: true })
-            const st = await Filesystem.stat({ path: `models/${f.path}`, directory: Directory.Data })
-            if (st.size < 50) throw new Error('empty file')
-            doneBytes += st.size
-            ok = true
-          } catch (e) {
-            lastErr = e
-          } finally {
-            await handle.remove()
-          }
-          if (ok) break
-        }
-        if (!ok) throw lastErr ?? new Error('download failed')
-      }
-      this.progress[id] = 1
+      await this.fetchFiles(id, m.files, m.sizeMB)
       this.status[id] = 'downloaded'
       this.markDone(id, true)
+      if (id === 'ozen') {
+        localStorage.setItem(VARIANT_KEY, 'int8')
+        this.upgradeAvailable = false
+      }
     } catch (e) {
       this.status[id] = 'error'
       this.error = 'ההורדה נכשלה. בדקו חיבור לאינטרנט ונסו שוב.'
       console.error(e)
     }
+  }
+
+  private async fetchFiles(id: EngineId, files: ModelDef['files'], sizeMB: number) {
+    this.cancelDownload = false
+    const total = sizeMB * 1024 * 1024
+    let doneBytes = 0
+    for (const f of files) {
+      const dir = `models/${f.path.split('/').slice(0, -1).join('/')}`
+      await Filesystem.mkdir({ path: dir, directory: Directory.Data, recursive: true }).catch(() => {})
+      let ok = false
+      let lastErr: unknown = null
+      for (const url of f.urls) {
+        if (this.cancelDownload) throw new Error('בוטל')
+        const handle = await Filesystem.addListener('progress', (p) => {
+          if (p.url !== url) return
+          this.progress[id] = Math.min(0.999, (doneBytes + p.bytes) / total)
+        })
+        try {
+          await Filesystem.downloadFile({ url, path: `models/${f.path}`, directory: Directory.Data, recursive: true, progress: true })
+          const st = await Filesystem.stat({ path: `models/${f.path}`, directory: Directory.Data })
+          if (st.size < 50) throw new Error('empty file')
+          doneBytes += st.size
+          ok = true
+        } catch (e) {
+          lastErr = e
+        } finally {
+          await handle.remove()
+        }
+        if (ok) break
+      }
+      if (!ok) throw lastErr ?? new Error('download failed')
+    }
+    this.progress[id] = 1
   }
 
   cancel() {
@@ -200,6 +298,10 @@ class SpeechEngine {
       await Filesystem.rmdir({ path: `models/${dir}`, directory: Directory.Data, recursive: true }).catch(() => {})
     }
     this.markDone(id, false)
+    if (id === 'ozen') {
+      localStorage.removeItem(VARIANT_KEY)
+      this.upgradeAvailable = false
+    }
     this.status[id] = isNative ? 'missing' : 'downloaded'
     if (settings.engine === id) settings.engine = 'ozen'
   }
@@ -233,8 +335,9 @@ class SpeechEngine {
         this.status.ozen = 'loading'
         const uri = await Filesystem.getUri({ path: 'models/ozen-v1', directory: Directory.Data })
         try {
-          const r = await this.guarded(() => Native.ozenLoad({ dir: uri.uri.replace(/^file:\/\//, ''), threads: this.threads() }))
+          const r = await this.guarded(() => Native.ozenLoad({ dir: uri.uri.replace(/^file:\/\//, ''), threads: this.threads(), lowMem: true, staged: this.lowMem() }))
           if (!r.ok) throw new Error('load failed')
+          this.modelFiles = [r.encoder, r.decoder].filter(Boolean).join(' + ')
           this.ozenNative = true
           this.status.ozen = 'ready'
         } catch (e) {
@@ -301,7 +404,8 @@ class SpeechEngine {
         type: 'load',
         localBase,
         modelId: isNative ? 'ozen-v1' : 'itayinbar/Ozen-v1',
-        encoder: OZEN_ENCODER,
+        encoder: isNative ? (localStorage.getItem(VARIANT_KEY) === 'int8' ? 'int8' : 'fp32') : OZEN_ENCODER,
+        decoder: isNative && localStorage.getItem(VARIANT_KEY) === 'int8' ? 'int8' : 'fp32',
         textOnly: native,
         threads: this.threads(),
       })
@@ -319,7 +423,22 @@ class SpeechEngine {
     if (this.ozenNative) {
       const t0 = performance.now()
       const f = await this.ask<{ features: Float32Array }>({ type: 'features', audio }, [audio.buffer])
-      const r = await this.guarded(() => Native.ozenRun({ features: float32ToB64(f.features), maxTokens: 220 }))
+      const b64 = float32ToB64(f.features)
+      let r: { tokens: number[] }
+      try {
+        r = await this.guarded(() => Native.ozenRun({ features: b64, maxTokens: 220 }))
+      } catch (e) {
+        const code = (e as { code?: string }).code
+        if (code !== 'ASR_DIED' && code !== 'NOT_LOADED') throw e
+        // The model runs in its own process; the system closed it for memory. The app is fine:
+        // switch to low-memory mode, load again one part at a time, and retry this piece once.
+        localStorage.setItem(LOWMEM_KEY, '1')
+        this.autoLowMem = true
+        this.ozenNative = false
+        this.status.ozen = 'downloaded'
+        await this.prepare('ozen')
+        r = await this.guarded(() => Native.ozenRun({ features: b64, maxTokens: 220 }))
+      }
       const d = await this.ask<{ text: string }>({ type: 'decode', tokens: r.tokens })
       return { text: d.text, ms: Math.round(performance.now() - t0) }
     }

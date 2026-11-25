@@ -102,7 +102,8 @@ class Jobs {
     const dir = (await Filesystem.getUri({ path: rel, directory: Directory.Data })).uri.replace(/^file:\/\//, '')
     let r: { ok: boolean }
     try {
-      r = await Native.recStart({ dir, chunkSec: 28, minChunkSec: 12 })
+      const sec = engine.chunkSec()
+      r = await Native.recStart({ dir, chunkSec: sec, minChunkSec: Math.max(5, Math.round(sec * 0.45)) })
     } catch (e) {
       const code = (e as { code?: string }).code
       throw new Error(
@@ -188,7 +189,7 @@ class Jobs {
   /** While recording, a weak device waits until the recording ends (recording + model together is too much). */
   private canWorkNow(j: Job): boolean {
     if (j.status !== 'recording') return true
-    return !settings.calm && !(engine.ramMB && engine.ramMB <= 2600)
+    return !settings.calm && !engine.lowMem()
   }
 
   private async run() {

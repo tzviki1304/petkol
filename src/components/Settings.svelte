@@ -22,6 +22,20 @@
   let sysFontsOpen = $state(false)
   let sysFonts = $state<{ name: string; file: string }[]>([])
   let dictOpen = $state(false)
+  let diagOpen = $state(false)
+  let diagText = $state('')
+
+  async function openDiag() {
+    diagText = await engine.diagnostics()
+    diagOpen = true
+  }
+
+  async function copyDiag() {
+    try {
+      await navigator.clipboard.writeText(diagText)
+      store.say('הועתק. אפשר להדביק ולשלוח')
+    } catch {}
+  }
 
   onMount(() => {
     if (section) setTimeout(() => document.getElementById('sec-' + section)?.scrollIntoView({ block: 'start' }), 60)
@@ -88,6 +102,18 @@
     { v: 15, label: 'אחרי 15 שניות שקט' },
     { v: 30, label: 'אחרי 30 שניות שקט' },
     { v: 60, label: 'אחרי דקה של שקט' },
+  ]
+  const LOWMEM: Opt[] = [
+    { v: 'auto', label: 'אוטומטי', hint: 'פועל במכשירים עם עד 3GB זיכרון, או אחרי סגירה בגלל זיכרון' },
+    { v: 'on', label: 'פועל', hint: 'רק חלק אחד של המודל בזיכרון בכל רגע. יציב, קצת איטי יותר' },
+    { v: 'off', label: 'כבוי', hint: 'למכשירים חזקים' },
+  ]
+  const CHUNKS: Opt[] = [
+    { v: 0, label: 'אוטומטי', hint: '15 שניות בחיסכון בזיכרון, אחרת 28' },
+    { v: 10, label: '10 שניות' },
+    { v: 15, label: '15 שניות' },
+    { v: 20, label: '20 שניות' },
+    { v: 28, label: '28 שניות', hint: 'הכי מעט עבודה למעבד' },
   ]
   const PROCESSING: Opt[] = [
     { v: 'auto', label: 'אוטומטי', hint: 'מהיר, ועובר לבטוח לבד אם יש בעיה' },
@@ -368,7 +394,18 @@
           {/if}
         </div>
       {/each}
+      {#if engine.upgradeAvailable && engine.status.ozen !== 'downloading'}
+        <div class="model active">
+          <div class="m-head"><span class="m-name">גרסה קלה של המודל הרגיל</span><span class="m-size">82MB</span></div>
+          <div class="m-desc">אותו דיוק, פי 3 פחות זיכרון ומהיר יותר. מומלץ במיוחד למכשירים עם 2GB. אחרי ההורדה הגרסה הכבדה נמחקת ומתפנה מקום.</div>
+          <div class="m-actions"><button class="btn primary" onclick={() => engine.upgradeOzen()}><Icon name="download" size={19} /> הורדת הגרסה הקלה</button></div>
+        </div>
+      {/if}
       {#if engine.error}<p class="g-note err">{engine.error}</p>{/if}
+      {#if isNative}
+        {@render row('device', 'חיסכון בזיכרון', label('lowMem', LOWMEM) + (settings.lowMem === 'auto' ? (engine.lowMem() ? ' (פועל)' : ' (כבוי)') : ''), () => choose('lowMem', 'חיסכון בזיכרון', LOWMEM), 'מונע מהמכשיר לסגור את האפליקציה באמצע תמלול')}
+        {@render row('wave', 'אורך קטע בהקלטה ארוכה', label('chunkSec', CHUNKS), () => choose('chunkSec', 'אורך קטע בהקלטה ארוכה', CHUNKS))}
+      {/if}
       {#if isNative}
         {@render row('settings', 'מנוע עיבוד', label('processing', PROCESSING) + (engine.nativeBroken && settings.processing === 'auto' ? ' (בטוח)' : ''), () => choose('processing', 'מנוע עיבוד', PROCESSING), engine.nativeBroken ? 'המנוע המהיר נכשל במכשיר הזה, לכן משתמשים בבטוח' : '')}
         {#if engine.nativeBroken}
@@ -440,6 +477,7 @@
 
     <div class="group">
       {@render row('help', 'מדריך קצר', '', () => store.go({ name: 'help' }))}
+      {@render row('info', 'מידע לתמיכה', '', openDiag, 'פרטי המכשיר והתקלה האחרונה, להעתקה ושליחה')}
       {@render row('heart', 'אודות והודות', '', () => store.go({ name: 'about' }))}
       {@render row('refresh', 'איפוס הגדרות', '', reset)}
     </div>
@@ -460,6 +498,11 @@
   {#each sysFonts as f (f.file)}
     <MenuItem icon="font" label={f.name} onclick={() => addSystemFont(f)} />
   {/each}
+</Sheet>
+
+<Sheet bind:open={diagOpen} title="מידע לתמיכה">
+  <pre class="diag">{diagText}</pre>
+  <div class="diag-actions"><button class="btn primary" onclick={copyDiag}><Icon name="copy" size={18} /> העתקה</button></div>
 </Sheet>
 
 <Sheet bind:open={dictOpen} title="מילון תיקונים">
@@ -538,6 +581,8 @@
 
   .upd { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 18px 14px; }
   .rep { display: flex; align-items: center; gap: 10px; padding: 4px 22px; }
+  .diag { margin: 4px 18px 10px; padding: 12px 14px; border-radius: var(--radius); background: var(--surface-2); white-space: pre-wrap; font-family: inherit; font-size: 0.88rem; line-height: 1.6; direction: rtl; }
+  .diag-actions { display: flex; justify-content: flex-end; padding: 0 18px 8px; }
   .rep .from { color: var(--danger); text-decoration: line-through; }
   .rep .to { flex: 1; font-weight: 700; }
 </style>

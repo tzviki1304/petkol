@@ -4,7 +4,8 @@ export interface PetkolNativePlugin {
   whisperLoad(o: { path: string; threads?: number }): Promise<{ ok: boolean }>
   whisperTranscribe(o: { audio: string; language?: string; prompt?: string }): Promise<{ text: string; ms: number }>
   whisperUnload(): Promise<void>
-  ozenLoad(o: { dir: string; threads?: number; lowMem?: boolean; memOpts?: string }): Promise<{ ok: boolean; ms: number }>
+  ozenLoad(o: { dir: string; threads?: number; lowMem?: boolean; memOpts?: string; staged?: boolean }): Promise<{ ok: boolean; ms: number; encoder?: string; decoder?: string; error?: string }>
+  lastExit(): Promise<{ reason: string; description?: string; timestamp?: number; pssMB?: number; rssMB?: number; status?: number; isNew?: boolean; processName?: string }>
   ozenRun(o: { features: string; maxTokens?: number }): Promise<{ tokens: number[]; ms: number }>
   ozenUnload(): Promise<void>
   whisperInfo(): Promise<{ loaded: boolean; path?: string; system: string }>

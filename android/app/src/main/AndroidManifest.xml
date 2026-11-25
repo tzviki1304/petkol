@@ -49,6 +49,13 @@
                 android:value="On-device speech-to-text of the user's own recordings; can take minutes on slow devices and must continue with the screen off." />
         </service>
 
+        <!-- Ozen (ONNX Runtime) runs here, in its own process: a low-memory kill of the model
+             must not take the notes UI down with it. -->
+        <service
+            android:name=".AsrService"
+            android:exported="false"
+            android:process=":asr" />
+
         <!-- ONNX Runtime ships a 1DS telemetry initializer: this is an offline app, keep it out. -->
         <provider
             android:name="ai.onnxruntime.TelemetryInitializer"

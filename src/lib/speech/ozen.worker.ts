@@ -12,7 +12,7 @@ import {
 } from '@huggingface/transformers'
 
 type Msg =
-  | { type: 'load'; localBase: string | null; modelId: string; encoder: 'fp16' | 'fp32'; threads: number; textOnly: boolean }
+  | { type: 'load'; localBase: string | null; modelId: string; encoder: 'fp16' | 'fp32' | 'int8'; decoder?: 'fp32' | 'int8'; threads: number; textOnly: boolean }
   | { type: 'transcribe'; id: number; audio: Float32Array }
   | { type: 'features'; id: number; audio: Float32Array }
   | { type: 'decode'; id: number; tokens: number[] }
@@ -54,7 +54,7 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
         tokenizer = await AutoTokenizer.from_pretrained(m.modelId)
         if (!m.textOnly) {
           model = await AutoModelForSpeechSeq2Seq.from_pretrained(m.modelId, {
-            dtype: { encoder_model: m.encoder, decoder_model_merged: 'fp32' },
+            dtype: { encoder_model: m.encoder, decoder_model_merged: m.decoder ?? 'fp32' },
             device: 'wasm',
             progress_callback: (p: { status: string; progress?: number; file?: string }) => {
               if (p.status === 'progress') post({ type: 'progress', file: p.file, progress: p.progress })

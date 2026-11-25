@@ -27,6 +27,8 @@ export interface Settings {
   // Dictation
   engine: EngineId
   processing: 'auto' | 'fast' | 'safe' // fast = native ONNX Runtime, safe = WASM inside the app
+  lowMem: 'auto' | 'on' | 'off' // one model part in memory at a time; auto = on for devices up to ~3GB
+  chunkSec: number // long-recording piece length; 0 = automatic (15 s in low-memory mode, else 28 s)
   calm: boolean // fewer threads + rests between pieces, kinder to weak devices
   tidyAfter: boolean // tidy the text of a long recording when it is done
   insertAt: 'cursor' | 'end'
@@ -66,6 +68,8 @@ export const defaults: Settings = {
   spellcheck: false,
   engine: 'ozen',
   processing: 'auto',
+  lowMem: 'auto',
+  chunkSec: 0,
   calm: true,
   tidyAfter: true,
   insertAt: 'cursor',

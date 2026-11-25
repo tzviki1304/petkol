@@ -107,7 +107,7 @@ public class PetkolNativePlugin extends Plugin {
     @Override
     protected void handleOnDestroy() {
         whisperExec.execute(this::freeWhisper);
-        ozenExec.execute(ozen::close);
+        ozenExec.execute(() -> { ozen.close(); if (asr != null) asr.release(); });
         super.handleOnDestroy();
     }
 
@@ -235,34 +235,81 @@ public class PetkolNativePlugin extends Plugin {
     }
 
     // ---------------------------------------------------------------- Ozen (ONNX Runtime)
+    // Runs in the ":asr" process (AsrService) by default, so a low-memory kill takes down only
+    // that process and the call rejects with ASR_DIED; process:false runs it in the app process.
+
+    private AsrClient asr;              // only touched on ozenExec
+    private boolean ozenInProcess = false;
+
+    private AsrClient asr() {
+        if (asr == null) asr = new AsrClient(getContext());
+        return asr;
+    }
+
+    private static JSObject bundleToJs(android.os.Bundle b) {
+        JSObject o = new JSObject();
+        for (String k : b.keySet()) {
+            Object v = b.get(k);
+            if ("rssKB".equals(k)) { o.put("rssMB", ((Long) v) / 1024); continue; }
+            if ("peakRssKB".equals(k)) { o.put("peakRssMB", ((Long) v) / 1024); continue; }
+            if ("code".equals(k)) continue;
+            if (v instanceof int[]) {
+                JSArray a = new JSArray();
+                for (int x : (int[]) v) a.put(x);
+                o.put(k, a);
+            } else {
+                o.put(k, v);
+            }
+        }
+        return o;
+    }
 
     @PluginMethod
     public void ozenLoad(final PluginCall call) {
         final String dir = call.getString("dir");
-        final Integer threads = call.getInt("threads");
-        final boolean xnnpack = Boolean.TRUE.equals(call.getBoolean("xnnpack", OZEN_XNNPACK_DEFAULT));
-        final boolean lowMem = Boolean.TRUE.equals(call.getBoolean("lowMem", OZEN_LOWMEM_DEFAULT));
         if (dir == null || dir.isEmpty()) {
             call.reject("dir is required", "BAD_ARGS");
             return;
         }
+        final Integer threads = call.getInt("threads");
+        final android.os.Bundle args = new android.os.Bundle();
+        args.putString("dir", dir);
+        args.putInt("threads", (threads != null && threads > 0) ? threads : defaultThreads());
+        args.putBoolean("xnnpack", Boolean.TRUE.equals(call.getBoolean("xnnpack", OZEN_XNNPACK_DEFAULT)));
+        args.putBoolean("lowMem", Boolean.TRUE.equals(call.getBoolean("lowMem", OZEN_LOWMEM_DEFAULT)));
+        args.putString("memOpts", call.getString("memOpts"));
+        args.putBoolean("staged", Boolean.TRUE.equals(call.getBoolean("staged", false)));
+        args.putString("variant", call.getString("variant", "auto"));
+        final boolean inProcess = Boolean.FALSE.equals(call.getBoolean("process", true));
         ozenExec.execute(() -> {
-            JSObject ret = new JSObject();
             long t0 = System.currentTimeMillis();
+            android.os.Bundle out;
             try {
-                int n = (threads != null && threads > 0) ? threads : defaultThreads();
-                OzenRunner.memOpts = call.getString("memOpts");
-                ozen.load(dir, n, xnnpack, lowMem);
-                ret.put("ok", true);
-                ret.put("encoder", ozen.encoderFile);
-                ret.put("providers", ozen.providers);
+                // drop whatever is loaded (in either place) before loading again
+                ozen.close();
+                if (asr != null) asr.release();
+                ozenInProcess = inProcess;
+                if (inProcess) {
+                    out = OzenOps.handle(ozen, OzenOps.LOAD, args);
+                } else {
+                    out = asr().call(OzenOps.LOAD, args);
+                    asr().loaded = out.getBoolean("ok", false);
+                }
+            } catch (AsrClient.AsrDiedException e) {
+                out = new android.os.Bundle();
+                out.putBoolean("ok", false);
+                out.putString("error", e.getMessage());
+                out.putString("errorCode", "ASR_DIED");
             } catch (Throwable t) {
                 Log.e(TAG, "ozenLoad", t);
-                ozen.close();
-                ret.put("ok", false);
-                ret.put("error", t.toString());
+                out = new android.os.Bundle();
+                out.putBoolean("ok", false);
+                out.putString("error", t.toString());
             }
+            JSObject ret = bundleToJs(out);
+            if (!ret.has("ok")) ret.put("ok", false);
             ret.put("ms", System.currentTimeMillis() - t0);
+            ret.put("process", inProcess ? "app" : "asr");
             call.resolve(ret);
         });
     }
@@ -277,22 +324,34 @@ public class PetkolNativePlugin extends Plugin {
         }
         ozenExec.execute(() -> {
             try {
-                if (!ozen.isLoaded()) {
-                    call.reject("no model loaded", "NOT_LOADED");
+                byte[] bytes = Base64.decode(features, Base64.DEFAULT);
+                android.os.Bundle args = new android.os.Bundle();
+                args.putInt("maxTokens", maxTokens);
+                android.os.Bundle out;
+                long t0 = System.currentTimeMillis();
+                if (ozenInProcess) {
+                    if (!ozen.isLoaded()) { call.reject("no model loaded", "NOT_LOADED"); return; }
+                    args.putByteArray("features", bytes);
+                    out = OzenOps.handle(ozen, OzenOps.RUN, args);
+                } else {
+                    if (asr == null || !asr.loaded) { call.reject("no model loaded", "NOT_LOADED"); return; }
+                    // ~1 MB: passed as a file, binder transactions are limited to 1 MB
+                    File f = new File(getContext().getCacheDir(), "asr-features.bin");
+                    try (java.io.FileOutputStream fos = new java.io.FileOutputStream(f)) { fos.write(bytes); }
+                    args.putString("featuresPath", f.getAbsolutePath());
+                    out = asr.call(OzenOps.RUN, args);
+                }
+                String code = out.getString("code");
+                if (code != null) {
+                    call.reject(out.getString("error", "failed"), code);
                     return;
                 }
-                byte[] bytes = Base64.decode(features, Base64.DEFAULT);
-                long t0 = System.currentTimeMillis();
-                int[] ids = ozen.run(bytes, maxTokens);
-                long ms = System.currentTimeMillis() - t0;
-                JSArray tokens = new JSArray();
-                for (int id : ids) tokens.put(id);
-                JSObject ret = new JSObject();
-                ret.put("tokens", tokens);
-                ret.put("ms", ms);
+                JSObject ret = bundleToJs(out);
+                ret.put("roundTripMs", System.currentTimeMillis() - t0);
                 call.resolve(ret);
-            } catch (IllegalArgumentException e) {
-                call.reject(e.getMessage(), "BAD_ARGS");
+            } catch (AsrClient.AsrDiedException e) {
+                Log.w(TAG, "ozenRun: " + e.getMessage());
+                call.reject(e.getMessage(), "ASR_DIED");
             } catch (Throwable t) {
                 Log.e(TAG, "ozenRun", t);
                 call.reject(t.toString(), "FAILED");
@@ -304,8 +363,81 @@ public class PetkolNativePlugin extends Plugin {
     public void ozenUnload(final PluginCall call) {
         ozenExec.execute(() -> {
             ozen.close();
+            if (asr != null) asr.release(); // the ":asr" process exits and frees everything
             call.resolve();
         });
+    }
+
+    // ---------------------------------------------------------------- why did the app die last time
+
+    private static String exitReason(int r) {
+        switch (r) {
+            case 3: return "low_memory";               // REASON_LOW_MEMORY
+            case 4: return "crash";                    // REASON_CRASH
+            case 5: return "crash_native";             // REASON_CRASH_NATIVE
+            case 6: return "anr";                      // REASON_ANR
+            case 2: return "signaled";                 // REASON_SIGNALED
+            case 1: return "exit_self";                // REASON_EXIT_SELF
+            case 10: return "user_requested";          // REASON_USER_REQUESTED
+            case 11: return "user_stopped";            // REASON_USER_STOPPED
+            case 9: return "excessive_resource_usage"; // REASON_EXCESSIVE_RESOURCE_USAGE
+            case 12: return "dependency_died";         // REASON_DEPENDENCY_DIED
+            case 14: return "freezer";                 // REASON_FREEZER (API 33+)
+            case 8: return "permission_change";        // REASON_PERMISSION_CHANGE
+            case 7: return "initialization_failure";   // REASON_INITIALIZATION_FAILURE
+            case 13: return "other";                   // REASON_OTHER
+            case 15: return "package_state_change";    // REASON_PACKAGE_STATE_CHANGE (API 33+)
+            case 16: return "package_updated";         // REASON_PACKAGE_UPDATED (API 33+)
+            default: return "unknown";                 // REASON_UNKNOWN (0) and anything newer
+        }
+    }
+
+    @PluginMethod
+    public void lastExit(PluginCall call) {
+        JSObject ret = new JSObject();
+        if (Build.VERSION.SDK_INT < 30) {
+            ret.put("reason", "unknown");
+            ret.put("isNew", false);
+            call.resolve(ret);
+            return;
+        }
+        try {
+            ActivityManager am = (ActivityManager) getContext().getSystemService(Context.ACTIVITY_SERVICE);
+            // Newest first. Skip WebView renderer (isolated/sandboxed) processes, which are also
+            // listed under our package: only the app process and ":asr" matter.
+            String pkg = getContext().getPackageName();
+            List<android.app.ApplicationExitInfo> list = new ArrayList<>();
+            for (android.app.ApplicationExitInfo x : am.getHistoricalProcessExitReasons(pkg, 0, 16)) {
+                String pn = x.getProcessName();
+                if (pn != null && (pn.equals(pkg) || pn.startsWith(pkg + ":"))) { list.add(x); break; }
+            }
+            android.content.SharedPreferences prefs =
+                    getContext().getSharedPreferences("petkol_native", Context.MODE_PRIVATE);
+            long lastSeen = prefs.getLong("lastExitSeen", 0);
+            if (list == null || list.isEmpty()) {
+                ret.put("reason", "unknown");
+                ret.put("isNew", false);
+            } else {
+                android.app.ApplicationExitInfo e = list.get(0);
+                ret.put("reason", exitReason(e.getReason()));
+                if (e.getDescription() != null) ret.put("description", e.getDescription());
+                ret.put("timestamp", e.getTimestamp());
+                ret.put("pssMB", e.getPss() / 1024);
+                ret.put("rssMB", e.getRss() / 1024);
+                ret.put("status", e.getStatus());
+                ret.put("processName", e.getProcessName());
+                ret.put("importance", e.getImportance());
+                boolean isNew = e.getTimestamp() > lastSeen;
+                ret.put("isNew", isNew);
+                if (isNew) prefs.edit().putLong("lastExitSeen", e.getTimestamp()).apply();
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "lastExit", t);
+            ret.put("reason", "unknown");
+            ret.put("isNew", false);
+            ret.put("description", t.toString());
+        }
+        call.resolve(ret);
     }
 
     // ---------------------------------------------------------------- background recording

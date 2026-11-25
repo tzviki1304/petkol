@@ -47,6 +47,24 @@
 - `src/app.css`: ערכות הצבעים (קרם, ספיה, כהה, דיו אלקטרוני), צבע מוביל, ורקעי מחברת.
 - `scripts/make-icons.mjs`: מייצר את אייקון האפליקציה ומסכי הפתיחה מהלוגו.
 
+## הכנת מחשב חדש (Windows)
+
+1. **Node.js 22** ו-**Git**.
+2. **JDK 21:** למשל Microsoft OpenJDK 21 מ-https://aka.ms/download-jdk/microsoft-jdk-21-windows-x64.zip. פורסים לתיקייה ומגדירים `JAVA_HOME`.
+3. **Android SDK:** הדרך הקלה היא Android Studio. דרך מנהל ה-SDK מתקינים:
+   - platform 36
+   - build-tools 36
+   - **NDK 27.1.12297006**
+   - **CMake 3.22.1**
+   - platform-tools
+4. **whisper.cpp:** `git clone --branch v1.9.6 https://github.com/ggml-org/whisper.cpp`. רושמים את הנתיב ב-`android/local.properties`:
+   ```
+   sdk.dir=C\:/Users/<you>/AppData/Local/Android/Sdk
+   whisper.dir=C:/path/to/whisper.cpp
+   ```
+5. **מפתח החתימה:** שמים את התיקייה `petkol-keys` (עם `petkol-release.jks` ו-`keystore.properties`) **ליד** תיקיית `petkol`, באותה תיקיית אם. אפשר גם להעתיק את `keystore.properties` לתוך `android/` ולתקן בו את `storeFile` לנתיב מלא.
+6. מריצים `npm install`, ואז `npm run build:android`, ואז `cd android` ו-`.\gradlew.bat assembleRelease -Pabis=arm64-v8a`.
+
 ## הרצה במחשב (לפיתוח הממשק)
 
 ```powershell

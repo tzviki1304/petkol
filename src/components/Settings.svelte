@@ -89,6 +89,11 @@
     { v: 30, label: 'אחרי 30 שניות שקט' },
     { v: 60, label: 'אחרי דקה של שקט' },
   ]
+  const PROCESSING: Opt[] = [
+    { v: 'auto', label: 'אוטומטי', hint: 'מהיר, ועובר לבטוח לבד אם יש בעיה' },
+    { v: 'fast', label: 'מהיר', hint: 'מנוע נייטיב, ריבוי מעבדים' },
+    { v: 'safe', label: 'בטוח', hint: 'איטי יותר, אבל יציב בכל מכשיר' },
+  ]
   const SENS: Opt[] = [
     { v: 'quiet', label: 'חדר שקט', hint: 'קולט גם דיבור חלש' },
     { v: 'normal', label: 'רגיל' },
@@ -364,6 +369,17 @@
         </div>
       {/each}
       {#if engine.error}<p class="g-note err">{engine.error}</p>{/if}
+      {#if isNative}
+        {@render row('settings', 'מנוע עיבוד', label('processing', PROCESSING) + (engine.nativeBroken && settings.processing === 'auto' ? ' (בטוח)' : ''), () => choose('processing', 'מנוע עיבוד', PROCESSING), engine.nativeBroken ? 'המנוע המהיר נכשל במכשיר הזה, לכן משתמשים בבטוח' : '')}
+        {#if engine.nativeBroken}
+          {@render row('refresh', 'לנסות שוב את המנוע המהיר', '', () => { engine.resetNativeBroken(); store.say('בפעם הבאה ננסה את המנוע המהיר') })}
+        {/if}
+      {/if}
+      {@render toggle('sparkle', 'עבודה רגועה', 'calm', 'פחות מעבדים והפסקות קטנות. איטי יותר, אבל לא מעמיס על מכשיר חלש')}
+      {@render toggle('lines', 'סידור אוטומטי בסוף הקלטה ארוכה', 'tidyAfter', 'פיסוק ופסקאות לטקסט שתומלל')}
+      {#if isNative}
+        {@render row('refresh', 'לאפשר עבודה ברקע', '', () => Native.requestIgnoreBatteryOptimizations().catch(() => {}), 'כדי שהמכשיר לא יעצור תמלול ארוך כשהמסך כבוי')}
+      {/if}
       {@render row('wave', 'הפסקה שסוגרת משפט', label('silenceMs', SILENCE), () => choose('silenceMs', 'כמה זמן שקט מסיים משפט', SILENCE))}
       {@render row('mic', 'רגישות המיקרופון', label('sensitivity', SENS), () => choose('sensitivity', 'רגישות המיקרופון', SENS))}
       {@render row('stop', 'עצירה אוטומטית', label('autoStopSec', AUTOSTOP), () => choose('autoStopSec', 'עצירה אוטומטית', AUTOSTOP))}

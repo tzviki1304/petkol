@@ -36,13 +36,15 @@ final class OzenRunner {
     private final List<String> pastNames = new ArrayList<>();   // past_key_values.{i}.{decoder|encoder}.{key|value}
     private int nHeads = 8, headDim = 64;
     String encoderFile;
+    /** Optional tuning override (comma list: noarena, nopattern, noprepack); null = derive from lowMem. */
+    static volatile String memOpts = null;
     String providers = "";
 
     boolean isLoaded() {
         return encoder != null && decoder != null;
     }
 
-    void load(String dir, int threads, boolean xnnpack) throws OrtException {
+    void load(String dir, int threads, boolean xnnpack, boolean lowMem) throws OrtException {
         close();
         if (env == null) env = OrtEnvironment.getEnvironment();
         try { env.setTelemetry(false); } catch (Throwable ignored) {}
@@ -55,9 +57,9 @@ final class OzenRunner {
             throw new IllegalArgumentException("model files not found in " + onnx);
         }
         StringBuilder prov = new StringBuilder();
-        encoder = createSession(enc.getPath(), threads, xnnpack, prov);
+        encoder = createSession(enc.getPath(), threads, xnnpack, lowMem, prov);
         prov.append(" / ");
-        decoder = createSession(dec.getPath(), threads, xnnpack, prov);
+        decoder = createSession(dec.getPath(), threads, xnnpack, lowMem, prov);
         encoderFile = enc.getName();
         providers = prov.toString();
 
@@ -74,12 +76,13 @@ final class OzenRunner {
             Log.w(TAG, "cannot read past kv shape, using defaults", e);
         }
         Log.i(TAG, "loaded " + enc.getName() + " + " + dec.getName() + " threads=" + threads
-                + " providers=" + providers + " pasts=" + pastNames.size() + " heads=" + nHeads + " dim=" + headDim);
+                + " lowMem=" + lowMem + " providers=" + providers + " pasts=" + pastNames.size() + " heads=" + nHeads + " dim=" + headDim);
     }
 
-    private OrtSession createSession(String path, int threads, boolean xnnpack, StringBuilder prov) throws OrtException {
+    private OrtSession createSession(String path, int threads, boolean xnnpack, boolean lowMem,
+                                     StringBuilder prov) throws OrtException {
         if (xnnpack) {
-            OrtSession.SessionOptions so = baseOptions(threads);
+            OrtSession.SessionOptions so = baseOptions(threads, lowMem);
             try {
                 // ORT's and XNNPACK's thread pools would otherwise spin against each other
                 so.addConfigEntry("session.intra_op.allow_spinning", "0");
@@ -94,13 +97,20 @@ final class OzenRunner {
                 so.close();
             }
         }
-        OrtSession s = env.createSession(path, baseOptions(threads));
+        OrtSession s = env.createSession(path, baseOptions(threads, lowMem));
         prov.append("cpu");
         return s;
     }
 
-    private static OrtSession.SessionOptions baseOptions(int threads) throws OrtException {
+    private static OrtSession.SessionOptions baseOptions(int threads, boolean lowMem) throws OrtException {
         OrtSession.SessionOptions so = new OrtSession.SessionOptions();
+        String opts = memOpts != null ? memOpts : (lowMem ? "noarena,nopattern,noprepack" : "");
+        // No CPU arena / memory-pattern pre-planning: buffers are freed as soon as they are
+        // dead instead of being kept in a grow-only arena. Lower peak RSS on 2 GB devices.
+        if (opts.contains("noarena")) so.setCPUArenaAllocator(false);
+        if (opts.contains("nopattern")) so.setMemoryPatternOptimization(false);
+        // No pre-packed (duplicated) GEMM weights: less memory, slower matmuls.
+        if (opts.contains("noprepack")) so.addConfigEntry("session.disable_prepacking", "1");
         so.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
         so.setIntraOpNumThreads(threads);
         so.setInterOpNumThreads(1);

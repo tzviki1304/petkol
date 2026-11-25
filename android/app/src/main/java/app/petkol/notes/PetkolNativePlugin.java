@@ -1,5 +1,6 @@
 package app.petkol.notes;
 
+import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.ActivityManager;
@@ -10,6 +11,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.print.PdfPrintHelper;
 import android.print.PrintAttributes;
 import android.print.PrintDocumentAdapter;
@@ -28,8 +30,11 @@ import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
+import com.getcapacitor.PermissionState;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -47,7 +52,12 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-@CapacitorPlugin(name = "PetkolNative")
+@CapacitorPlugin(
+        name = "PetkolNative",
+        permissions = {
+                @Permission(alias = "microphone", strings = {Manifest.permission.RECORD_AUDIO}),
+                @Permission(alias = "notifications", strings = {Manifest.permission.POST_NOTIFICATIONS})
+        })
 public class PetkolNativePlugin extends Plugin {
     private static final String TAG = "PetkolNative";
 
@@ -70,6 +80,8 @@ public class PetkolNativePlugin extends Plugin {
 
     /** Default for ozenLoad's optional "xnnpack" flag: the CPU EP measured ~2x faster on Ozen. */
     private static final boolean OZEN_XNNPACK_DEFAULT = false;
+    /** Default for ozenLoad's optional "lowMem" flag (no ORT arena, memory patterns or weight prepacking). */
+    private static final boolean OZEN_LOWMEM_DEFAULT = true;
 
     // whisper state (written only on whisperExec)
     private volatile long whisperCtx = 0;
@@ -81,6 +93,13 @@ public class PetkolNativePlugin extends Plugin {
 
     @Override
     public void load() {
+        // Background services -> JS events, and WebView keep-alive while they run. Cheap, no native libs.
+        ServiceBus.setListener(this::onServiceEvent);
+        ServiceBus.setKeepAliveChanged(() -> {
+            if (getBridge() != null && getBridge().getWebView() instanceof PetkolWebView) {
+                ((PetkolWebView) getBridge().getWebView()).refreshKeepAlive();
+            }
+        });
         // Native libraries (whisper.cpp, ONNX Runtime) load lazily, on the first dictation,
         // so the notes app always opens even if a speech engine cannot run on a device.
     }
@@ -222,6 +241,7 @@ public class PetkolNativePlugin extends Plugin {
         final String dir = call.getString("dir");
         final Integer threads = call.getInt("threads");
         final boolean xnnpack = Boolean.TRUE.equals(call.getBoolean("xnnpack", OZEN_XNNPACK_DEFAULT));
+        final boolean lowMem = Boolean.TRUE.equals(call.getBoolean("lowMem", OZEN_LOWMEM_DEFAULT));
         if (dir == null || dir.isEmpty()) {
             call.reject("dir is required", "BAD_ARGS");
             return;
@@ -231,7 +251,8 @@ public class PetkolNativePlugin extends Plugin {
             long t0 = System.currentTimeMillis();
             try {
                 int n = (threads != null && threads > 0) ? threads : defaultThreads();
-                ozen.load(dir, n, xnnpack);
+                OzenRunner.memOpts = call.getString("memOpts");
+                ozen.load(dir, n, xnnpack, lowMem);
                 ret.put("ok", true);
                 ret.put("encoder", ozen.encoderFile);
                 ret.put("providers", ozen.providers);
@@ -285,6 +306,193 @@ public class PetkolNativePlugin extends Plugin {
             ozen.close();
             call.resolve();
         });
+    }
+
+    // ---------------------------------------------------------------- background recording
+
+    private final List<PluginCall> pendingRecStops = new ArrayList<>();
+
+    @PluginMethod
+    public void recStart(final PluginCall call) {
+        if (call.getString("dir") == null) {
+            call.reject("dir is required", "BAD_ARGS");
+            return;
+        }
+        if (getPermissionState("microphone") != PermissionState.GRANTED) {
+            requestPermissionForAlias("microphone", call, "recPermissionCallback");
+            return;
+        }
+        doRecStart(call);
+    }
+
+    @PermissionCallback
+    private void recPermissionCallback(PluginCall call) {
+        if (getPermissionState("microphone") == PermissionState.GRANTED) doRecStart(call);
+        else call.reject("microphone permission denied", "NO_PERMISSION");
+    }
+
+    private void doRecStart(final PluginCall call) {
+        if (RecService.isRecording()) {
+            call.reject("already recording", "ALREADY_RECORDING");
+            return;
+        }
+        final String dir = call.getString("dir");
+        final double chunkSec = call.getDouble("chunkSec", 28.0);
+        final double minChunkSec = call.getDouble("minChunkSec", 12.0);
+        final boolean[] done = {false};
+        final Runnable timeout = () -> {
+            if (done[0]) return;
+            done[0] = true;
+            ServiceBus.recStartResult = null;
+            call.reject("recording service did not start", "FAILED");
+        };
+        ServiceBus.recStartResult = (err) -> main.post(() -> {
+            if (done[0]) return;
+            done[0] = true;
+            main.removeCallbacks(timeout);
+            if (err == null) {
+                JSObject ret = new JSObject();
+                ret.put("ok", true);
+                call.resolve(ret);
+            } else if ("ALREADY_RECORDING".equals(err)) {
+                call.reject("already recording", "ALREADY_RECORDING");
+            } else {
+                call.reject(err, "FAILED");
+            }
+        });
+        try {
+            androidx.core.content.ContextCompat.startForegroundService(getContext(),
+                    RecService.startIntent(getContext(), dir, chunkSec, minChunkSec));
+            main.postDelayed(timeout, 8000);
+        } catch (Throwable t) {
+            done[0] = true;
+            ServiceBus.recStartResult = null;
+            Log.e(TAG, "recStart", t);
+            call.reject("cannot start recording service: " + t, fgsErrorCode(t));
+        }
+    }
+
+    @PluginMethod
+    public void recStop(final PluginCall call) {
+        if (!RecService.isRecording()) {
+            JSObject st = RecService.status();
+            JSObject ret = new JSObject();
+            ret.put("files", st.opt("files"));
+            ret.put("seconds", st.opt("seconds"));
+            call.resolve(ret);
+            return;
+        }
+        synchronized (pendingRecStops) { pendingRecStops.add(call); }
+        try {
+            getContext().startService(RecService.stopIntent(getContext()));
+        } catch (Throwable t) {
+            synchronized (pendingRecStops) { pendingRecStops.remove(call); }
+            call.reject("cannot stop recording: " + t, "FAILED");
+        }
+    }
+
+    /** Android 12+ refuses to start foreground services while the app is in the background. */
+    private static String fgsErrorCode(Throwable t) {
+        return t.getClass().getName().contains("ForegroundServiceStartNotAllowed") ? "IN_BACKGROUND" : "FAILED";
+    }
+
+    @PluginMethod
+    public void recStatus(PluginCall call) {
+        call.resolve(RecService.status());
+    }
+
+    /** Called (main thread) for every service event before it goes to JS listeners. */
+    private void onServiceEvent(String name, JSObject data) {
+        if ("recStopped".equals(name)) {
+            List<PluginCall> calls;
+            synchronized (pendingRecStops) {
+                calls = new ArrayList<>(pendingRecStops);
+                pendingRecStops.clear();
+            }
+            for (PluginCall c : calls) {
+                JSObject ret = new JSObject();
+                ret.put("files", data.opt("files"));
+                ret.put("seconds", data.opt("seconds"));
+                c.resolve(ret);
+            }
+        }
+        notifyListeners(name, data);
+    }
+
+    // ---------------------------------------------------------------- background work keep-alive
+
+    @PluginMethod
+    public void workStart(PluginCall call) {
+        try {
+            WorkService.start(getContext(), call.getString("title", "פתקול"), call.getString("text"));
+            call.resolve();
+        } catch (Throwable t) {
+            Log.e(TAG, "workStart", t);
+            call.reject("cannot start work service: " + t, fgsErrorCode(t));
+        }
+    }
+
+    @PluginMethod
+    public void workUpdate(PluginCall call) {
+        WorkService.update(getContext(), call.getString("text"), call.getInt("progress"), call.getInt("max"));
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void workStop(PluginCall call) {
+        try {
+            if (WorkService.isRunning()) WorkService.stop(getContext());
+        } catch (Throwable t) {
+            Log.w(TAG, "workStop", t);
+        }
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void requestNotifications(PluginCall call) {
+        if (Build.VERSION.SDK_INT < 33 || getPermissionState("notifications") == PermissionState.GRANTED) {
+            JSObject ret = new JSObject();
+            ret.put("granted", true);
+            call.resolve(ret);
+            return;
+        }
+        requestPermissionForAlias("notifications", call, "notificationsCallback");
+    }
+
+    @PermissionCallback
+    private void notificationsCallback(PluginCall call) {
+        JSObject ret = new JSObject();
+        ret.put("granted", getPermissionState("notifications") == PermissionState.GRANTED);
+        call.resolve(ret);
+    }
+
+    private boolean ignoringBatteryOptimizations() {
+        if (Build.VERSION.SDK_INT < 23) return true;
+        PowerManager pm = (PowerManager) getContext().getSystemService(Context.POWER_SERVICE);
+        return pm.isIgnoringBatteryOptimizations(getContext().getPackageName());
+    }
+
+    @PluginMethod
+    public void requestIgnoreBatteryOptimizations(PluginCall call) {
+        JSObject ret = new JSObject();
+        boolean ignoring = ignoringBatteryOptimizations();
+        ret.put("ignoring", ignoring);
+        boolean opened = false;
+        if (!ignoring) {
+            try {
+                Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:" + getContext().getPackageName()));
+                getActivity().startActivity(i);
+                opened = true;
+            } catch (Exception e) {
+                try {
+                    getActivity().startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+                    opened = true;
+                } catch (Exception ignored) {}
+            }
+        }
+        ret.put("opened", opened);
+        call.resolve(ret);
     }
 
     // ---------------------------------------------------------------- PDF
@@ -449,7 +657,31 @@ public class PetkolNativePlugin extends Plugin {
         ret.put("manufacturer", Build.MANUFACTURER);
         ret.put("model", Build.MODEL);
         ret.put("sdk", Build.VERSION.SDK_INT);
+        ret.put("lowRam", am.isLowRamDevice());
+        ret.put("memClassMB", am.getMemoryClass());
+        ret.put("largeMemClassMB", am.getLargeMemoryClass());
+        long[] rss = procRssKB();
+        ret.put("appRssMB", rss[0] / 1024);
+        ret.put("appPeakRssMB", rss[1] / 1024);
+        ret.put("ignoringBatteryOptimizations", ignoringBatteryOptimizations());
+        try {
+            android.content.pm.PackageInfo wv = Build.VERSION.SDK_INT >= 26 ? WebView.getCurrentWebViewPackage() : null;
+            if (wv != null) ret.put("webView", wv.packageName + " " + wv.versionName);
+        } catch (Throwable ignored) {}
         call.resolve(ret);
+    }
+
+    /** {VmRSS, VmHWM} of this process in kB (native + Java + mapped model pages). */
+    static long[] procRssKB() {
+        long[] r = {0, 0};
+        try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader("/proc/self/status"))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.startsWith("VmRSS:")) r[0] = Long.parseLong(line.replaceAll("[^0-9]", ""));
+                else if (line.startsWith("VmHWM:")) r[1] = Long.parseLong(line.replaceAll("[^0-9]", ""));
+            }
+        } catch (Exception ignored) {}
+        return r;
     }
 
     @PluginMethod

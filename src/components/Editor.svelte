@@ -12,6 +12,10 @@
   import MenuItem from './MenuItem.svelte'
   import FolderPicker from './FolderPicker.svelte'
   import DictationBar from './DictationBar.svelte'
+  import LongRecBar from './LongRecBar.svelte'
+  import TidySheet from './TidySheet.svelte'
+  import { jobs } from '../lib/speech/jobs.svelte'
+  import { isNative } from '../lib/native'
   import { confirmDialog } from './Dialog.svelte'
   import { store, displayTitle, formatDate } from '../lib/store.svelte'
   import { settings } from '../lib/settings.svelte'
@@ -20,7 +24,8 @@
   import { dictation } from '../lib/speech/engine.svelte'
   import type { Paper } from '../lib/types'
 
-  let { id, dictate = false }: { id: string; dictate?: boolean } = $props()
+  let { id, dictate = false, longRec = false }: { id: string; dictate?: boolean; longRec?: boolean } = $props()
+  let tidyOpen = $state(false)
 
   const note = $derived(store.note(id))
   let el: HTMLDivElement | undefined = $state()
@@ -69,17 +74,27 @@
       },
     })
     words = editor.storage.characterCount.words()
-    if (dictate) setTimeout(toggleMic, 250)
+    jobs.setBridge({
+      noteId: id,
+      append: (t, newParagraph) => appendText(t, newParagraph),
+      getHtml: () => editor?.getHTML() ?? '',
+      setHtml: (html) => {
+        editor?.commands.setContent(html, { emitUpdate: true })
+      },
+    })
+    if (longRec) setTimeout(startLong, 250)
+    else if (dictate) setTimeout(toggleMic, 250)
     else if (!note.text.trim() && !note.title.trim()) setTimeout(() => editor?.commands.focus('end'), 120)
   })
 
   onDestroy(() => {
+    jobs.setBridge(null)
     dictation.stop()
     store.flushSaves()
     editor?.destroy()
     // throw away a note that was opened and never written in
     const n = store.note(id)
-    if (n && !n.title.trim() && !n.text.trim() && !n.html.includes('data-type="taskList"')) store.deleteForever('note', id)
+    if (n && !jobs.forNote(id) && !n.title.trim() && !n.text.trim() && !n.html.includes('data-type="taskList"')) store.deleteForever('note', id)
   })
 
   function is(name: string, attrs?: Record<string, unknown>) {
@@ -162,6 +177,45 @@
       store.say(String((e as Error).message))
       if (String((e as Error).message).includes('לא הורד')) store.go({ name: 'settings', section: 'dictation' })
     }
+  }
+
+  /** Text from a long recording: always at the end, continuing the open sentence or as a new paragraph. */
+  function appendText(text: string, newParagraph: boolean) {
+    const ed = editor
+    if (!ed) return
+    const parts = text.split(/\n+/).filter((x) => x.trim())
+    parts.forEach((part, i) => {
+      const last = ed.state.doc.lastChild
+      const lastText = last?.textContent ?? ''
+      const isPara = last?.type.name === 'paragraph'
+      const cont = !(newParagraph && i === 0) && i === 0 && isPara && lastText.length > 0 && lastText.length < 700 && !/[.?!:]["״']?\s*$/.test(lastText)
+      const size = ed.state.doc.content.size
+      if (cont) {
+        ed.commands.insertContentAt(size - 1, { type: 'text', text: ' ' + part })
+      } else if (isPara && lastText.length === 0) {
+        ed.commands.insertContentAt(size - 1, { type: 'text', text: part })
+      } else {
+        ed.commands.insertContentAt(size, { type: 'paragraph', content: [{ type: 'text', text: part }] })
+      }
+    })
+  }
+
+  function noteText(): string {
+    return editor?.getText({ blockSeparator: '\n\n' }) ?? ''
+  }
+
+  async function startLong() {
+    if (dictation.active) await dictation.stop()
+    try {
+      await jobs.startRecording(id)
+    } catch (e) {
+      store.say(String((e as Error).message))
+    }
+  }
+
+  function applyTidy(html: string) {
+    editor?.chain().focus().setContent(html, { emitUpdate: true }).run()
+    store.say('הטקסט סודר ✓')
   }
 
   function insertDictated(text: string) {
@@ -252,6 +306,7 @@
 
   {#if fmtVisible && settings.toolbarPosition === 'bottom'}{@render toolbar()}{/if}
 
+  <LongRecBar noteId={id} />
   <DictationBar onmic={toggleMic} {words} />
 </div>
 
@@ -301,6 +356,10 @@
 </Sheet>
 
 <Sheet bind:open={menuOpen}>
+  {#if isNative && !jobs.recording}
+    <MenuItem icon="wave" label="הקלטה ארוכה" hint="מדברים כמה שרוצים, והתמלול נעשה ברקע, לאט ובדיוק" onclick={() => { menuOpen = false; startLong() }} />
+  {/if}
+  <MenuItem icon="sparkle" label="סידור הטקסט" hint="פיסוק, פסקאות, כותרות ורשימות" onclick={() => { menuOpen = false; tidyOpen = true }} />
   <MenuItem icon="lines" label="סוג דף" hint="נקי, שורות, משבצות או נקודות" onclick={() => { menuOpen = false; paperOpen = true }} />
   <MenuItem icon="pin" label={note?.pinned ? 'ביטול הצמדה' : 'הצמדה למעלה'} onclick={() => { menuOpen = false; store.togglePin(id) }} />
   <MenuItem icon="move" label="העברה לתיקייה" onclick={() => { menuOpen = false; pickOpen = true }} />
@@ -324,6 +383,8 @@
 </Sheet>
 
 <FolderPicker bind:open={pickOpen} current={note?.folderId ?? null} onpick={(f) => { store.moveNote(id, f); store.say('ההערה הועברה') }} />
+
+<TidySheet bind:open={tidyOpen} source={tidyOpen ? noteText() : ''} onapply={applyTidy} />
 
 <style>
   .ed-top { min-height: 54px; }

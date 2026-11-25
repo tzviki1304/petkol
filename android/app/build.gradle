@@ -9,6 +9,9 @@ def whisperDir() {
     return d.replace('\\', '/')
 }
 
+// ONNX Runtime version (override with -PortVersion=x.y.z for testing).
+ext.ORT_VERSION = "1.27.0"  // 1.28+ crash at load under ARM translation (see report)
+
 // App version comes from package.json (single source of truth).
 def appVersion() {
     def pkg = new groovy.json.JsonSlurper().parse(rootProject.file('../package.json'))
@@ -104,7 +107,7 @@ dependencies {
     implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
     implementation project(':capacitor-android')
     // Ozen-v1 (ONNX). Native libs are limited to ndk.abiFilters above.
-    implementation "com.microsoft.onnxruntime:onnxruntime-android:1.32.0"
+    implementation "com.microsoft.onnxruntime:onnxruntime-android:${project.findProperty('ortVersion') ?: ORT_VERSION}"
     testImplementation "junit:junit:$junitVersion"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"

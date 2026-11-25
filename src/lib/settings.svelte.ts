@@ -26,6 +26,9 @@ export interface Settings {
   spellcheck: boolean
   // Dictation
   engine: EngineId
+  processing: 'auto' | 'fast' | 'safe' // fast = native ONNX Runtime, safe = WASM inside the app
+  calm: boolean // fewer threads + rests between pieces, kinder to weak devices
+  tidyAfter: boolean // tidy the text of a long recording when it is done
   insertAt: 'cursor' | 'end'
   silenceMs: number // pause that closes a phrase
   autoStopSec: number // 0 = never
@@ -62,6 +65,9 @@ export const defaults: Settings = {
   showTitle: true,
   spellcheck: false,
   engine: 'ozen',
+  processing: 'auto',
+  calm: true,
+  tidyAfter: true,
   insertAt: 'cursor',
   silenceMs: 900,
   autoStopSec: 0,

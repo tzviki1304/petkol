@@ -15,6 +15,7 @@
   import { settings } from './lib/settings.svelte'
   import { fontStack } from './lib/fonts.svelte'
   import { engine, dictation } from './lib/speech/engine.svelte'
+  import { jobs } from './lib/speech/jobs.svelte'
   import { updater } from './lib/update.svelte'
   import { isNative } from './lib/native'
   import { StatusBar, Style } from '@capacitor/status-bar'
@@ -38,6 +39,15 @@
       StatusBar.setBackgroundColor({ color: bg }).catch(() => {})
       StatusBar.setStyle({ style: settings.theme === 'dark' ? Style.Dark : Style.Light }).catch(() => {})
     }
+  })
+
+  // background transcription resumes once the notes are open (after unlock)
+  $effect(() => {
+    if (store.ready && !store.locked) jobs.init().then(() => jobs.kick())
+  })
+
+  $effect(() => {
+    if (engine.notice) store.say(engine.notice)
   })
 
   $effect(() => {
@@ -96,7 +106,7 @@
     {#if v.name === 'library'}
       <Library folderId={v.folderId} />
     {:else if v.name === 'note'}
-      <Editor id={v.id} dictate={v.dictate} />
+      <Editor id={v.id} dictate={v.dictate} longRec={v.longRec} />
     {:else if v.name === 'settings'}
       <Settings section={v.section} />
     {:else if v.name === 'search'}

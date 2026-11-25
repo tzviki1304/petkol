@@ -24,7 +24,7 @@ export type Paper = 'plain' | 'lined' | 'grid' | 'dots'
 
 export type View =
   | { name: 'library'; folderId: string | null }
-  | { name: 'note'; id: string; dictate?: boolean }
+  | { name: 'note'; id: string; dictate?: boolean; longRec?: boolean }
   | { name: 'settings'; section?: string }
   | { name: 'search' }
   | { name: 'trash' }

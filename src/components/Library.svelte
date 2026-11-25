@@ -9,6 +9,9 @@
   import { settings, saveSettings } from '../lib/settings.svelte'
   import { exportPdf, shareText } from '../lib/exporter'
   import type { Folder, Note, Paper } from '../lib/types'
+  import TidySheet from './TidySheet.svelte'
+  import { jobs } from '../lib/speech/jobs.svelte'
+  import { isNative } from '../lib/native'
 
   let { folderId }: { folderId: string | null } = $props()
 
@@ -24,6 +27,18 @@
   let itemOpen = $state(false)
   let pickOpen = $state(false)
   let sortOpen = $state(false)
+  let tidyOpen = $state(false)
+
+  async function newLongRec() {
+    newOpen = false
+    const n = await store.createNote(folderId, '')
+    store.go({ name: 'note', id: n.id, longRec: true })
+  }
+
+  async function tidyToNote(html: string) {
+    const n = await store.createNote(folderId, html)
+    store.go({ name: 'note', id: n.id })
+  }
 
   function openFolder(f: Folder) {
     store.go({ name: 'library', folderId: f.id })
@@ -168,6 +183,7 @@
                 {#if n.pinned}<span class="pin"><Icon name="pin" size={15} /></span>{/if}
                 {#if paperIcon(n) === 'checklist'}<span class="kind"><Icon name="checklist" size={16} /></span>{/if}
                 <span class="n-title">{displayTitle(n)}</span>
+                {#if jobs.forNote(n.id)}<span class="busy-badge">{jobs.forNote(n.id)?.status === 'recording' ? 'מקליט' : 'מתמלל…'}</span>{/if}
               </div>
               {#if settings.previewLines > 0 && previewText(n)}
                 <div class="n-prev" style="-webkit-line-clamp:{settings.previewLines}">{previewText(n)}</div>
@@ -206,6 +222,10 @@
   <MenuItem icon="checklist" label="רשימת משימות" hint="משימות עם וי" onclick={() => newNote('tasks')} />
   <MenuItem icon="grid" label="דף משבצות" onclick={() => newNote('grid')} />
   <MenuItem icon="mic" label="הערה בהכתבה" hint="פותח הערה ומתחיל להקשיב" onclick={() => newNote(settings.defaultPaper, true)} />
+  {#if isNative}
+    <MenuItem icon="wave" label="הקלטה ארוכה" hint="5 דקות או שעה. התמלול נעשה ברקע, בשקט ובדיוק" onclick={newLongRec} />
+  {/if}
+  <MenuItem icon="sparkle" label="סידור טקסט" hint="מדביקים טקסט, והוא יוצא מסודר ויפה" onclick={() => { newOpen = false; tidyOpen = true }} />
   <MenuItem icon="folderPlus" label="תיקייה חדשה" hint={folderId ? 'בתוך ' + folder?.name : ''} onclick={newFolder} />
 </Sheet>
 
@@ -245,6 +265,8 @@
     <MenuItem icon="trash" label="מחיקה" danger onclick={() => deleteFolder(f)} />
   {/if}
 </Sheet>
+
+<TidySheet bind:open={tidyOpen} onapply={tidyToNote} />
 
 <FolderPicker
   bind:open={pickOpen}
@@ -291,6 +313,8 @@
   .row-more { position: absolute; top: 8px; inset-inline-end: 4px; width: 40px; height: 40px; display: grid; place-items: center; color: var(--faint); border-radius: 50%; }
   .n-head { display: flex; align-items: center; gap: 6px; }
   .pin, .kind { color: var(--accent); display: grid; }
+  .busy-badge { flex: none; font-size: 0.72rem; font-weight: 700; padding: 1px 8px; border-radius: 99px; background: var(--accent-soft); color: var(--accent-text); }
+  :global([data-theme='eink']) .busy-badge { border: 1px solid #000; background: #fff; }
   .n-title { font-weight: 700; font-size: 1.07rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .n-prev {
     margin-top: 3px; color: var(--muted); font-size: 0.95rem; line-height: 1.45;

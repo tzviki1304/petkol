@@ -53,6 +53,9 @@ export const MODELS: ModelDef[] = [
   },
 ]
 
+const TRY_KEY = 'petkol.nativeTry'
+const BROKEN_KEY = 'petkol.nativeBroken'
+
 export type ModelStatus = 'missing' | 'downloading' | 'downloaded' | 'loading' | 'ready' | 'error'
 
 class SpeechEngine {
@@ -60,6 +63,9 @@ class SpeechEngine {
   progress = $state<Record<EngineId, number>>({ ozen: 0, ivrit: 0 })
   error = $state<string>('')
   ramMB = $state(0)
+  /** Set when the fast native engine crashed the app; we then use the slower, safe engine. */
+  nativeBroken = $state(false)
+  notice = $state('')
 
   private worker: Worker | null = null
   private workerReady: Promise<void> | null = null
@@ -77,6 +83,44 @@ class SpeechEngine {
       try {
         this.ramMB = (await Native.deviceInfo()).totalRamMB
       } catch {}
+      // A crash inside native code kills the whole app, so we leave a marker before each native call.
+      // If the marker survived, the previous run died there: switch to the safe engine.
+      if (localStorage.getItem(TRY_KEY)) {
+        localStorage.removeItem(TRY_KEY)
+        localStorage.setItem(BROKEN_KEY, '1')
+        this.notice = 'המנוע המהיר נכשל במכשיר הזה, ולכן עברנו למנוע הבטוח. הוא איטי יותר, אבל יציב.'
+      }
+      this.nativeBroken = localStorage.getItem(BROKEN_KEY) === '1'
+    }
+  }
+
+  /** Threads for the model: fewer on small devices so the CPU and memory are not overwhelmed. */
+  threads(): number {
+    const cores = navigator.hardwareConcurrency || 4
+    if (settings.calm || (this.ramMB && this.ramMB <= 2600)) return Math.min(2, cores)
+    return Math.min(4, cores)
+  }
+
+  /** Whether Ozen runs natively (fast) or inside the app's own WASM runtime (slow, but safe everywhere). */
+  useNativeOzen(): boolean {
+    if (!isNative) return false
+    if (settings.processing === 'safe') return false
+    if (settings.processing === 'fast') return true
+    return !this.nativeBroken
+  }
+
+  resetNativeBroken() {
+    localStorage.removeItem(BROKEN_KEY)
+    this.nativeBroken = false
+    this.notice = ''
+  }
+
+  private async guarded<T>(fn: () => Promise<T>): Promise<T> {
+    localStorage.setItem(TRY_KEY, String(Date.now()))
+    try {
+      return await fn()
+    } finally {
+      localStorage.removeItem(TRY_KEY)
     }
   }
 
@@ -164,6 +208,7 @@ class SpeechEngine {
     this.worker?.terminate()
     this.worker = null
     this.workerReady = null
+    this.workerMode = null
     if (this.status.ozen === 'ready') this.status.ozen = 'downloaded'
   }
 
@@ -177,12 +222,18 @@ class SpeechEngine {
         this.nativeLoaded = null
         this.status.ivrit = 'downloaded'
       }
-      await this.startWorker()
-      if (isNative && !this.ozenNative) {
+      const native = this.useNativeOzen()
+      if (this.workerMode !== null && this.workerMode !== native) this.disposeWorker()
+      if (!native && this.ozenNative) {
+        await Native.ozenUnload().catch(() => {})
+        this.ozenNative = false
+      }
+      await this.startWorker(native)
+      if (native && !this.ozenNative) {
         this.status.ozen = 'loading'
         const uri = await Filesystem.getUri({ path: 'models/ozen-v1', directory: Directory.Data })
         try {
-          const r = await Native.ozenLoad({ dir: uri.uri.replace(/^file:\/\//, ''), threads: Math.min(4, navigator.hardwareConcurrency || 4) })
+          const r = await this.guarded(() => Native.ozenLoad({ dir: uri.uri.replace(/^file:\/\//, ''), threads: this.threads() }))
           if (!r.ok) throw new Error('load failed')
           this.ozenNative = true
           this.status.ozen = 'ready'
@@ -190,6 +241,8 @@ class SpeechEngine {
           this.status.ozen = 'downloaded'
           throw new Error('טעינת המודל נכשלה. נסו למחוק ולהוריד אותו מחדש.')
         }
+      } else if (!native) {
+        this.status.ozen = 'ready'
       }
     } else {
       if (this.ozenNative) {
@@ -203,7 +256,7 @@ class SpeechEngine {
       try {
         const info = await Native.deviceInfo().catch(() => null)
         if (info && info.availRamMB < 900) throw new Error('low memory')
-        const r = await Native.whisperLoad({ path })
+        const r = await this.guarded(() => Native.whisperLoad({ path, threads: this.threads() }))
         if (!r.ok) throw new Error('load failed')
         this.nativeLoaded = 'ivrit'
         this.status.ivrit = 'ready'
@@ -214,8 +267,11 @@ class SpeechEngine {
     }
   }
 
-  private async startWorker() {
+  private workerMode: boolean | null = null
+
+  private async startWorker(native: boolean) {
     if (this.workerReady) return this.workerReady
+    this.workerMode = native
     this.status.ozen = 'loading'
     this.workerReady = new Promise<void>(async (resolve, reject) => {
       const w = new OzenWorker()
@@ -228,7 +284,6 @@ class SpeechEngine {
       w.onmessage = (e) => {
         const m = e.data
         if (m.type === 'loaded') {
-          if (!isNative) this.status.ozen = 'ready'
           resolve()
         } else if (m.type === 'progress') {
           if (!isNative && typeof m.progress === 'number') this.progress.ozen = m.progress / 100
@@ -247,8 +302,8 @@ class SpeechEngine {
         localBase,
         modelId: isNative ? 'ozen-v1' : 'itayinbar/Ozen-v1',
         encoder: OZEN_ENCODER,
-        textOnly: isNative,
-        threads: Math.min(4, navigator.hardwareConcurrency || 2),
+        textOnly: native,
+        threads: this.threads(),
       })
     })
     return this.workerReady
@@ -258,13 +313,13 @@ class SpeechEngine {
     const id = settings.engine
     await this.prepare(id)
     if (id === 'ivrit') {
-      const r = await Native.whisperTranscribe({ audio: float32ToB64(audio), language: 'he', prompt: settings.vocabulary || undefined })
+      const r = await this.guarded(() => Native.whisperTranscribe({ audio: float32ToB64(audio), language: 'he', prompt: settings.vocabulary || undefined }))
       return { text: r.text.trim(), ms: r.ms }
     }
-    if (isNative) {
+    if (this.ozenNative) {
       const t0 = performance.now()
       const f = await this.ask<{ features: Float32Array }>({ type: 'features', audio }, [audio.buffer])
-      const r = await Native.ozenRun({ features: float32ToB64(f.features), maxTokens: 220 })
+      const r = await this.guarded(() => Native.ozenRun({ features: float32ToB64(f.features), maxTokens: 220 }))
       const d = await this.ask<{ text: string }>({ type: 'decode', tokens: r.tokens })
       return { text: d.text, ms: Math.round(performance.now() - t0) }
     }
@@ -297,7 +352,9 @@ const COMMANDS: [RegExp, string][] = [
 ]
 
 export function cleanText(raw: string): string {
-  let t = raw.replace(/\s+/g, ' ').trim()
+  // drop invisible direction marks the model sometimes emits, and results with no letters at all
+  let t = raw.replace(/[‎‏‪-‮⁦-⁩]/g, '').replace(/\s+/g, ' ').trim()
+  if (!/[\p{L}\p{N}]/u.test(t)) return ''
   for (const r of settings.replacements) {
     if (!r.from.trim()) continue
     t = t.split(r.from.trim()).join(r.to)

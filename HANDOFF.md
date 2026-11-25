@@ -48,10 +48,20 @@ npm run build
 npx cap sync android
 $env:JAVA_HOME = "C:\Users\770tz\tools\jdk-21.0.13.1+2"
 cd android
-.\gradlew.bat assembleRelease
+.\gradlew.bat assembleRelease -Pabis=arm64-v8a
 ```
 
 ה-APK נוצר ב-`android/app/build/outputs/apk/release/app-release.apk`.
+
+- `-Pabis=arm64-v8a` בונה רק למעבדי 64 ביט (Boox וכמעט כל טלפון מהשנים האחרונות), ו-APK יוצא קטן בהרבה. בלי הפרמטר נבנות גם הגרסאות armeabi-v7a (טלפונים ישנים מאוד) ו-x86_64 (לאמולטור), וה-APK כבד בהרבה בגלל ONNX Runtime.
+- הבנייה הנייטיב הראשונה (whisper.cpp) לוקחת כ-10–15 דקות, ואחר כך שניות.
+- whisper.cpp נמצא ב-`C:\Users\770tz\tools\whisper.cpp` (גרסה v1.9.6). אפשר לשנות את הנתיב עם `whisper.dir=` ב-`android/local.properties`.
+- פיתוח ובדיקה על האמולטור: `.\gradlew.bat assembleDebug`, מתקינים עם `adb install -r`, ומתחברים ל-WebView דרך `chrome://inspect`.
+
+## דברים שכדאי לדעת
+- **transformers.js 4.3:** כשנותנים לו נתיב מקומי בצורת כתובת https, הוא לא מזהה שהקבצים קיימים. לכן ב-`ozen.worker.ts` התיקייה במכשיר מוגדרת בתור `remoteHost`. בפועל שום בקשה לא יוצאת מהמכשיר.
+- **הפלאגין הנייטיב:** whisper ו-Ozen רצים כל אחד על thread משלו, ושניהם יכולים לרוץ באותו זמן. במכשיר עם 2GB זיכרון אסור לטעון את שניהם יחד, ו-`engine.prepare()` דואג לפרוק את השני.
+- **המודל המדויק** צריך בערך 750MB זיכרון, ובמעבד חלש הוא איטי מאוד: דקות לכל משפט.
 
 ### מפתח החתימה: חשוב מאוד
 - המפתח נמצא ב-`C:\Users\770tz\Desktop\petkol-keys\` (`petkol-release.jks` ו-`keystore.properties`). הוא **לא** נמצא ב-GitHub.

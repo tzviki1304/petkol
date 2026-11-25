@@ -31,7 +31,7 @@ final class OzenRunner {
     static final int EOS_TOKEN = 2;
     static final int N_MELS = 80, N_FRAMES = 3000;
 
-    private final OrtEnvironment env = OrtEnvironment.getEnvironment();
+    private OrtEnvironment env; // created on first load: loading libonnxruntime is deferred until it is needed
     private OrtSession encoder, decoder;
     private final List<String> pastNames = new ArrayList<>();   // past_key_values.{i}.{decoder|encoder}.{key|value}
     private int nHeads = 8, headDim = 64;
@@ -44,6 +44,7 @@ final class OzenRunner {
 
     void load(String dir, int threads, boolean xnnpack) throws OrtException {
         close();
+        if (env == null) env = OrtEnvironment.getEnvironment();
         try { env.setTelemetry(false); } catch (Throwable ignored) {}
         File onnx = new File(dir, "onnx");
         if (!onnx.isDirectory()) onnx = new File(dir); // also accept the onnx folder itself

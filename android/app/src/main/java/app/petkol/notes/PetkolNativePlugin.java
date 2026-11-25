@@ -81,7 +81,8 @@ public class PetkolNativePlugin extends Plugin {
 
     @Override
     public void load() {
-        whisperExec.execute(() -> WhisperLib.init(getContext()));
+        // Native libraries (whisper.cpp, ONNX Runtime) load lazily, on the first dictation,
+        // so the notes app always opens even if a speech engine cannot run on a device.
     }
 
     @Override

@@ -9,6 +9,25 @@ def whisperDir() {
     return d.replace('\\', '/')
 }
 
+// App version comes from package.json (single source of truth).
+def appVersion() {
+    def pkg = new groovy.json.JsonSlurper().parse(rootProject.file('../package.json'))
+    return pkg.version as String
+}
+def appVersionCode() {
+    def p = appVersion().tokenize('.').collect { it as int }
+    return p[0] * 10000 + p[1] * 100 + p[2]
+}
+
+// Release signing: android/keystore.properties, or ../petkol-keys/keystore.properties (never committed).
+def signingProps() {
+    def props = new Properties()
+    def candidates = [rootProject.file('keystore.properties'), rootProject.file('../../petkol-keys/keystore.properties')]
+    def f = candidates.find { it.exists() }
+    if (f) f.withInputStream { props.load(it) }
+    return props
+}
+
 android {
     namespace = "app.petkol.notes"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -16,8 +35,8 @@ android {
         applicationId "app.petkol.notes"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode appVersionCode()
+        versionName appVersion()
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         ndk {
             // arm64-v8a: target devices (Boox), armeabi-v7a: old 32-bit devices, x86_64: emulator only
@@ -52,8 +71,20 @@ android {
             useLegacyPackaging = true
         }
     }
+    signingConfigs {
+        release {
+            def s = signingProps()
+            if (s.getProperty('storeFile')) {
+                storeFile file(s.getProperty('storeFile'))
+                storePassword s.getProperty('storePassword')
+                keyAlias s.getProperty('keyAlias')
+                keyPassword s.getProperty('keyPassword')
+            }
+        }
+    }
     buildTypes {
         release {
+            signingConfig signingConfigs.release
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }

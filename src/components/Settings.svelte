@@ -477,7 +477,7 @@
   .group { margin: 8px 14px 14px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-lg); overflow: hidden; }
   :global([data-theme='eink']) .group { border: 1.5px solid #000; }
   .g-title { font-family: var(--font-display); font-weight: 700; font-size: 1.15rem; padding: 16px 18px 6px; }
-  .g-note { margin: 0; padding: 0 18px 10px; font-size: 0.88rem; color: var(--muted); line-height: 1.55; }
+  .g-note { margin: 0; padding: 0 18px 10px; font-size: 0.88rem; color: var(--muted); line-height: 1.55; white-space: pre-line; }
   .g-note.err { color: var(--danger); }
 
   .srow { width: 100%; display: flex; align-items: center; gap: 14px; min-height: 58px; padding: 8px 18px; text-align: start; border-top: 1px solid var(--line); }
